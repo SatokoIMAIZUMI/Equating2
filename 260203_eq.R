@@ -15,16 +15,16 @@ for (p in packages) {
 
 set.seed(123)
 
-# ★論文用設定★
+
 CONFIG <- list(
-  N_EXAMINEES = 1000,
-  N_REPS = 20,
+  N_EXAMINEES = 3000,
+  N_REPS = 100,
   N_UNIQUE = 20,
   TRUE_A = 1.2,
   TRUE_B = 0.5,
   D_CONST = 1.702,
-  DRIFT_MAG = 2.5,       # ドリフト量
-  OUTLIER_PROP = 0.3     # 外れ値の割合 
+  DRIFT_MAG = 2.0,       # ドリフト量
+  OUTLIER_PROP = 0.2    # 外れ値の割合 
 )
 
 # ------------------------------------------------------------------------------
@@ -44,12 +44,13 @@ pi_func <- function(theta, a, b, A, B, D=1.702) {
 
 # Divergence (Element-wise)
 calc_div_element <- function(P, pi_val, div_type="DPD", param=0.1) {
+  #計算安定性のため
   eps <- 1e-9
   P <- pmax(pmin(P, 1-eps), eps)
   pi_val <- pmax(pmin(pi_val, 1-eps), eps)
   
   if(div_type == "DPD") { 
-    beta <- param
+    beta <- param#tuning parameter
     term1 <- -(1/beta) * (P * pi_val^beta + (1-P) * (1-pi_val)^beta)
     term2 <- (1/(1+beta)) * (pi_val^(1+beta) + (1-pi_val)^(1+beta))
     return(term1 + term2)
@@ -69,24 +70,24 @@ obj_func_total <- function(eta, a_new, b_new, P_ref, nodes, weights, div_type, p
   A <- eta[1]; B <- eta[2]
   loss <- 0
   for(j in 1:length(a_new)) {
-    pi_vec <- pi_func(nodes, a_new[j], b_new[j], A, B, D)
-    div_vec <- calc_div_element(P_ref[,j], pi_vec, div_type, param)
+    pi_vec <- pi_func(nodes, a_new[j], b_new[j], A, B, D)#等化後正答確率
+    div_vec <- calc_div_element(P_ref[,j], pi_vec, div_type, param)#損失
     loss <- loss + sum(div_vec * weights)
   }
   return(loss)
 }
 
 
-# Estimation with Sandwich Variance
+# Estimation with Sandwich Variance(SE cal)
 estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_type, param, D=1.702){
-  start_val <- c(CONFIG$TRUE_A, CONFIG$TRUE_B)#初期値
+  start_val <- c(1, 0) # 初期値
   
-  # 1. Point Estimation
+  # 1. Point Estimation (点推定)
   opt <- tryCatch({
     optim(par = start_val, fn = obj_func_total, 
           a_new = a_new, b_new = b_new, P_ref = P_ref, 
           nodes = nodes, weights = weights, div_type = div_type, param = param, D = D,
-          method = "Nelder-Mead", control = list(maxit = 5000))
+          method = "BFGS", control = list(maxit = 5000))
   }, error = function(e) NULL)
   
   if(is.null(opt) || opt$convergence != 0) return(list(conv=FALSE))
@@ -94,45 +95,129 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
   hat_A <- opt$par[1]; hat_B <- opt$par[2]
   
   # 2. Sandwich Variance: V = H^-1 G H^-1
-  #へシアン行列(目的関数の2回微分）2×2
-  H <- numDeriv::hessian(obj_func_total, x=c(hat_A, hat_B), 
-                         a_new=a_new, b_new=b_new, P_ref=P_ref, 
-                         nodes=nodes, weights=weights, div_type=div_type, param=param, D=D)
-  
-  
-  obj_func_single <- function(eta, j, idx_m, a_new, b_new, P_ref, nodes, weights, div_type, param, D) {
-    # 1つの項目j、1つの求積点mだけの損失
-    A <- eta[1]; B <- eta[2]
-    # idx_m を使ってアクセス
-    pi_val <- pi_func(nodes[idx_m], a_new[j], b_new[j], A, B, D)
-    div_val <- calc_div_element(P_ref[idx_m, j], pi_val, div_type, param)
-    return(div_val * weights[idx_m])
-  }
+  # 解析解を用いて H と G を同時に計算する (高速化)
   
   J <- length(a_new)
   M <- length(nodes)
-  G <- matrix(0, 2, 2)
+  
+  # 行列の初期化
+  H <- matrix(0, 2, 2) # Bread (Hessian)
+  G <- matrix(0, 2, 2) # Meat (Outer product of scores)
+  
+  eps <- 1e-9 # 数値安定化用
   
   for(j in 1:J) {
+    aj <- a_new[j]
+    bj <- b_new[j]
+    
+    # Random Item Theory: 項目単位のスコアベクトルを初期化
+    Psi_j_sum <- c(0, 0) 
+    
     for(m in 1:M) {
+      theta <- nodes[m]
+      wt <- weights[m]
+      P_val <- P_ref[m, j]
       
-      psi_jm <- numDeriv::grad(obj_func_single, x=c(hat_A, hat_B),
-                               j=j, idx_m=m, 
-                               a_new=a_new, b_new=b_new, P_ref=P_ref,
-                               nodes=nodes, weights=weights, div_type=div_type, param=param, D=D)
+      # --- 共通計算: pi と z ---
+      z <- - (D * aj / hat_A) * (theta - hat_A * bj - hat_B)
+      pi_val <- 1 / (1 + exp(z))
+      pi_val <- pmax(pmin(pi_val, 1-eps), eps) # ガード
+      p1p <- pi_val * (1 - pi_val)
       
-      G <- G + (psi_jm %*% t(psi_jm))#勾配の外積和
+      # --- 勾配用パーツ (1階微分) ---
+      dz_dA <- (D * aj / hat_A^2) * (theta - hat_B)
+      dz_dB <- (D * aj / hat_A)
+      dz_d_eta <- c(dz_dA, dz_dB)
+      
+      d_pi_d_eta <- p1p * dz_d_eta
+      
+      # --- ヘッセ行列用パーツ (2階微分) ---
+      # zの2階微分
+      d2z_dA2 <- -2 * (D * aj / hat_A^3) * (theta - hat_B)
+      d2z_dAdB <- - (D * aj / hat_A^2)
+      d2z_d_eta2 <- matrix(c(d2z_dA2, d2z_dAdB, d2z_dAdB, 0), 2, 2)
+      
+      # piの2階微分
+      term_grad_prod <- p1p * (1 - 2 * pi_val) * (dz_d_eta %*% t(dz_d_eta))
+      term_hess_z    <- p1p * d2z_d_eta2
+      d2_pi_d_eta2   <- term_grad_prod + term_hess_z
+      
+      # --- ダイバージェンスの微分 ---
+      dD_dpi <- 0
+      d2D_dpi2 <- 0
+      
+      if (div_type == "DPD") {
+        beta <- param
+        # 1階
+        term_pow1 <- (1 - pi_val)^(beta - 1) + pi_val^(beta - 1)
+        dD_dpi <- (pi_val - P_val) * term_pow1
+        # 2階
+        d_term_pow1 <- (beta - 1) * (pi_val^(beta - 2) - (1 - pi_val)^(beta - 2))
+        d2D_dpi2 <- term_pow1 + (pi_val - P_val) * d_term_pow1
+        
+      } else if (div_type == "gamma") {
+        gamma <- param
+        # Gamma定義
+        pi_g_1  <- pi_val^(gamma - 1); ipi_g_1 <- (1 - pi_val)^(gamma - 1)
+        pi_g    <- pi_val * pi_g_1;    ipi_g   <- (1 - pi_val) * ipi_g_1
+        
+        N1 <- P_val * pi_g_1 - (1 - P_val) * ipi_g_1
+        D1 <- P_val * pi_g + (1 - P_val) * ipi_g
+        N2 <- pi_g - ipi_g
+        D2 <- pi_val * pi_g + (1 - pi_val) * ipi_g
+        
+        # 1階
+        dD_dpi <- - (N1 / D1) + (N2 / D2)
+        
+        # 2階 (商の微分)
+        pi_g_2  <- pi_val^(gamma - 2); ipi_g_2 <- (1 - pi_val)^(gamma - 2)
+        dN1 <- (gamma - 1) * (P_val * pi_g_2 + (1 - P_val) * ipi_g_2)
+        dD1 <- gamma * N1
+        term1_2nd <- - (dN1 * D1 - N1 * dD1) / (D1^2)
+        
+        dN2 <- gamma * (pi_g_1 + ipi_g_1)
+        dD2 <- (1 + gamma) * N2
+        term2_2nd <- (dN2 * D2 - N2 * dD2) / (D2^2)
+        
+        d2D_dpi2 <- term1_2nd + term2_2nd
+        
+      } else { 
+        # KL
+        dD_dpi <- (pi_val - P_val) / p1p
+        d2D_dpi2 <- (p1p - (pi_val - P_val)*(1 - 2*pi_val)) / (p1p^2)
+      }
+      
+      # --- H行列への加算 (Chain Rule) ---
+      # A_element = (d2D/dpi2) * (d_pi)(d_pi)^T + (dD/dpi) * (d2_pi)
+      term1 <- d2D_dpi2 * (d_pi_d_eta %*% t(d_pi_d_eta))
+      term2 <- dD_dpi * d2_pi_d_eta2
+      H <- (H + (term1 + term2) * wt)
+      
+      # --- 勾配ベクトル (Psi) の蓄積 ---
+      # psi_jm = dD/dpi * d_pi/d_eta * w
+      psi_jm <- (dD_dpi * d_pi_d_eta) * wt　#これだともしかして重みが2乗されるかも
+      Psi_j_sum <- Psi_j_sum + psi_jm
     }
+    
+    # --- G行列への加算 (Random Item Theory) ---
+    # 項目単位のスコアの合計の外積をとる
+    G <- (G + (Psi_j_sum %*% t(Psi_j_sum)))
   }
   
-  inv_H <- try(solve(H), silent=TRUE)#Hの逆行列
+  #分散の計算
+  H <- H/J
+  G <- G/J
+  # 3. 分散共分散行列の計算
+  inv_H <- try(solve(H), silent=TRUE) # Hの逆行列
+  
   if(inherits(inv_H, "try-error")) {
     CovMat <- matrix(NA, 2, 2)
+    SE <- c(NA, NA)
   } else {
-    CovMat <- inv_H %*% G %*% inv_H#共分散行列
+    CovMat <- inv_H %*% G %*% inv_H/J # サンドイッチ推定量
+    SE <- sqrt(diag(CovMat))        # 標準誤差
   }
   
-  SE <- sqrt(diag(CovMat))#標準誤差の計算
   return(list(A=hat_A, B=hat_B, SE_A=SE[1], SE_B=SE[2], CovMat=CovMat, conv=TRUE))
 }
 
@@ -159,6 +244,7 @@ run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
       if(n_drift > 0){
         idx <- sample(1:J, n_drift)
         b_com_new_true[idx] <- b_com_new_true[idx] + CONFIG$DRIFT_MAG
+        a_com_new_true[idx] <- a_com_new_true[idx]*1.5
       }
     }
     #独自項目の生成
@@ -216,20 +302,24 @@ run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
 results_list <- list()
 counter <- 1
 
-J_vec <- c(5, 20, 80)#共通項目数
-M_vec <- c(21, 41, 101)# 求積点数
+J_vec <- c(5, 10, 20, 30, 50, 80)#共通項目数
+M_vec <- c(301)# 求積点数
 conditions <- expand.grid(J=J_vec, M=M_vec)#全組み合わせ
 
 methods <- list(
-  list(name="KL (Approx)", type="DPD", p=0.01),
+  #list(name="KL (Approx)", type="DPD", p=0.01),
+  list(name="DPD (0.1)",   type="DPD", p=0.1),
   list(name="DPD (0.3)",   type="DPD", p=0.3),
   list(name="DPD (0.5)",   type="DPD", p=0.5),
   list(name="DPD (1.0)",   type="DPD", p=1.0),
+  #list(name="DPD (1.0)",   type="DPD", p=1.0),
+  #list(name="Gamma (0.1)", type="gamma", p=0.1),
   list(name="Gamma (0.3)", type="gamma", p=0.3),
-  list(name="Gamma (0.5)", type="gamma", p=0.5)
+  list(name="Gamma (0.5)", type="gamma", p=0.5),
+  list(name="Gamma (1.0)", type="gamma", p=1.0)
 )
 
-outlier_conds <- c(FALSE, TRUE)
+outlier_conds <- c(TRUE)
 
 cat("【Step 1/2】統計的性質の検証シミュレーションを開始します...\n")
 cat(sprintf("  総条件数: %d x 3手法 x 2状況 (反復各%d回)\n", nrow(conditions), CONFIG$N_REPS))
@@ -278,20 +368,58 @@ summary_stats <- all_results %>%
     SE_Ratio = mean(SE_A, na.rm=TRUE) / sd(A),
     
     Coverage = mean(abs(A - CONFIG$TRUE_A) < 1.96 * SE_A, na.rm=TRUE),
+    
+    Mean_B = mean(B),
+    Bias_B = mean(B - CONFIG$TRUE_B),
+    RMSE_B = sqrt(mean((B - CONFIG$TRUE_B)^2)),
+    Mean_SE_B = mean(SE_B, na.rm=TRUE),
+    SD_Est_B = sd(B),
+    
+    
+    SE_Ratio_B = mean(SE_B, na.rm=TRUE) / sd(B),
+    
+    Coverage_B = mean(abs(B - CONFIG$TRUE_B) < 1.96 * SE_B, na.rm=TRUE),
+    
     .groups = 'drop'
   )
 
 # 列ができたか確認
 head(summary_stats)
+
+##可視化----------------------------
 # Plot 1: 一致性 (Consistency - RMSE)
 p1 <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
-             aes(x=factor(J), y=RMSE_A, group=Method, color=Method)) +
+             aes(x=factor(J), y=RMSE_B, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="1. Consistency (RMSE Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="RMSE of A")
+  labs(title="1. Consistency (RMSE Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="RMSE of B")
+
+p1_d_A <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+             aes(x=factor(J), y=Bias_A, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="1. Consistency (BIAS A Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="RMSE of A")
+
+p1_d_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+                 aes(x=factor(J), y=Bias_B, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="1. Consistency (BIAS B Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="RMSE of B")
+
+p1_d_A <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+                 aes(x=factor(J), y=RMSE_A, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="1. Consistency (RMSE A Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="RMSE of A")
+
+p1_d_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+                 aes(x=factor(J), y=RMSE_B, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="1. Consistency (RMSE B Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="RMSE of B")
 
 # Plot 2: 分散推定 (Variance - SE Ratio)
-p2 <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
+p2 <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
              aes(x=factor(J), y=SE_Ratio, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
   facet_wrap(~ M, labeller = label_both) +
@@ -306,29 +434,39 @@ p3 <- ggplot(summary_stats, aes(x=factor(J), y=Coverage, group=Method, color=Met
   labs(title="3. CI Coverage Probability", subtitle="Target=0.95. Comparison of Robustness.", x="Items (J)", y="Coverage")
 
 # Plot 4: 漸近正規性 (Normality - QQ Plot)
-dat_norm <- all_results %>% filter(Condition=="No_Outlier", J==80, M==81)
+dat_norm <- all_results %>% filter(Condition=="No_Outlier", J==80, M==301)
 p4 <- ggplot(dat_norm, aes(sample=A)) + stat_qq(aes(color=Method)) + stat_qq_line() +
   facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
   labs(title="4. Asymptotic Normality", subtitle="Condition: No Outlier, J=80, M=81", x="Theoretical", y="Sample")
 
-grid.arrange(p1, p2, p3, p4, ncol=2)
+dat_norm <- all_results %>% filter(Condition=="With_Drift", J==500, M==301)
+p4_d <- ggplot(dat_norm, aes(sample=A)) + stat_qq(aes(color=Method)) + stat_qq_line() +
+  facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=500, M=301", x="Theoretical", y="Sample")
+
+p4_d_B <- ggplot(dat_norm, aes(sample=B)) + stat_qq(aes(color=Method)) + stat_qq_line() +
+  facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=500, M=301", x="Theoretical", y="Sample")
+
+grid.arrange(p1_d_A, p1_d_B,ncol=2)
 
 
 library(ggplot2)
 library(dplyr)
 
+# 信頼帯プロット------------------------------------------------
 # ==============================================================================
 # 1. 準備：データ生成（外れ値あり）
 # ==============================================================================
-set.seed(123)
+set.seed(1234)
 
 # 設定
-J_test <- 40             # 項目数
-M_test <- 41             # 求積点数
+J_test <- 50             # 項目数
+M_test <- 301             # 求積点数
 TRUE_A <- 1.2            # 真のA
 TRUE_B <- 0.5            # 真のB
-DRIFT_MAG <- 3.0         # ドリフト（外れ値）の大きさ
-OUTLIER_PROP <- 0.3      # 外れ値の割合 
+DRIFT_MAG <- 2.0         # ドリフト（外れ値）の大きさ
+OUTLIER_PROP <- 0.1      # 外れ値の割合 
 
 # パラメータ生成
 a_ref <- rlnorm(J_test, 0, 0.3)
@@ -349,7 +487,7 @@ nodes <- seq(-4, 4, length.out=M_test)
 weights <- dnorm(nodes)
 weights <- weights / sum(weights)
 
-# 基準テストの確率分布 P_ref
+# 基準テストの確率分布 P_ref（求積点×項目数の行列）
 P_ref <- matrix(0, M_test, J_test)
 for(j in 1:J_test) P_ref[,j] <- p_func(nodes, a_ref[j], b_ref[j])
 
@@ -358,9 +496,12 @@ for(j in 1:J_test) P_ref[,j] <- p_func(nodes, a_ref[j], b_ref[j])
 # 2. 推定の実行（ロバスト vs 非ロバスト）
 # ==============================================================================
 methods_list <- list(
-  list(name="KL ", type="DPD", param=0.01), # KL近似
-  list(name="Robust (DPD)",    type="DPD", param=0.3)   # 提案手法
+  list(name="DPD(0.01) ", type="DPD", param=0.0001), # KL近似
+  list(name="DPD(0.5)",    type="DPD", param=0.5) ,
+  list(name="gamma(0.5)",    type="gamma", param=0.5)
+
 )
+
 
 plot_data <- data.frame()
 theta_seq <- seq(-4, 4, length.out = 100) # スコアの範囲 (-4から+4まで)
