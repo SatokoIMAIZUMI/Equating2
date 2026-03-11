@@ -23,8 +23,8 @@ CONFIG <- list(
   TRUE_A = 1.2,
   TRUE_B = 0.5,
   D_CONST = 1.702,
-  DRIFT_MAG = 1.0,       # ドリフト量(b)
-  OUTLIER_PROP = 0.2    # 外れ値の割合 
+  DRIFT_MAG = 0.5,       # ドリフト量(b)大きすぎ？
+  OUTLIER_PROP = 0.05    # 外れ値の割合
 )
 
 # ------------------------------------------------------------------------------
@@ -530,7 +530,21 @@ p2 <- ggplot(summary_stats %>% filter(Condition == "With_Drift"),
   geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
   facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="2. SE Accuracy (Sandwich/Empirical)", subtitle="Target=1.0 (No Outlier)", x="Items (J)", y="SE Ratio")
+  labs(title="2. SE Accuracy (Sandwich/Empirical)", subtitle="Target=1.0 (With Drift)", x="Items (J)", y="SE Ratio")
+
+p2_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+             aes(x=factor(J), y=SE_Ratio_B, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
+  facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="2. SE Accuracy(B) (Sandwich/Empirical)", subtitle="Target=1.0 (With Drift)", x="Items (J)", y="SE Ratio")
+
+p2_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
+             aes(x=factor(J), y=SE_Ratio, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
+  facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="2. SE Accuracy (Sandwich/Empirical)", subtitle="Target=1.0 (With Drift)", x="Items (J)", y="SE Ratio")
 
 # Plot 3: 信頼区間 (Coverage) - 外れ値の影響比較
 p3 <- ggplot(summary_stats, aes(x=factor(J), y=Coverage, group=Method, color=Method)) +
@@ -540,19 +554,19 @@ p3 <- ggplot(summary_stats, aes(x=factor(J), y=Coverage, group=Method, color=Met
   labs(title="3. CI Coverage Probability", subtitle="Target=0.95. Comparison of Robustness.", x="Items (J)", y="Coverage")
 
 # Plot 4: 漸近正規性 (Normality - QQ Plot)
-dat_norm <- all_results %>% filter(Condition=="No_Outlier", J==80, M==301)
+dat_norm <- all_results %>% filter(Condition=="No_Outlier", J==1000, M==301)
 p4 <- ggplot(dat_norm, aes(sample=A)) + stat_qq(aes(color=Method)) + stat_qq_line() +
   facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="4. Asymptotic Normality", subtitle="Condition: No Outlier, J=80, M=81", x="Theoretical", y="Sample")
+  labs(title="4. Asymptotic Normality", subtitle="Condition: No Outlier, J=1000, M=301", x="Theoretical", y="Sample")
 
-dat_norm <- all_results %>% filter(Condition=="With_Drift", J==500, M==301)
-p4_d <- ggplot(dat_norm, aes(sample=A)) + stat_qq(aes(color=Method)) + stat_qq_line() +
+dat_norm <- all_results %>% filter(Condition=="With_Drift", J==1000, M==301)
+p4_d_A <- ggplot(dat_norm, aes(sample=A)) + stat_qq(aes(color=Method)) + stat_qq_line() +
   facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=500, M=301", x="Theoretical", y="Sample")
+  labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=1000, M=301", x="Theoretical", y="Sample")
 
 p4_d_B <- ggplot(dat_norm, aes(sample=B)) + stat_qq(aes(color=Method)) + stat_qq_line() +
   facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=500, M=301", x="Theoretical", y="Sample")
+  labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=1000, M=301", x="Theoretical", y="Sample")
 
 grid.arrange(p1_b_A, p1_b_B,ncol=2)
 grid.arrange(p1_r_A, p1_r_B,ncol=2)
