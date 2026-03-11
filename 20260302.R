@@ -13,7 +13,7 @@ for (p in packages) {
   }
 }
 
-set.seed(123)
+set.seed(425)
 
 
 CONFIG <- list(
@@ -23,7 +23,7 @@ CONFIG <- list(
   TRUE_A = 1.2,
   TRUE_B = 0.5,
   D_CONST = 1.702,
-  DRIFT_MAG = 2.0,       # ドリフト量(b)
+  DRIFT_MAG = 1.0,       # ドリフト量(b)
   OUTLIER_PROP = 0.2    # 外れ値の割合 
 )
 
@@ -79,12 +79,13 @@ obj_func_total <- function(eta, a_new, b_new, P_ref, nodes, weights, div_type, p
 
 
 # Estimation with Sandwich Variance(SE cal)
-estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_type, param, D=1.702){
-  start_val <- c(1, 0) # 初期値
+estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_type, param, D=1.702, start_val=c(1, 1)){
+  
+  
   
   # 1. Point Estimation (点推定)
   opt <- tryCatch({
-    optim(par = start_val, fn = obj_func_total, 
+    optim(par = start_val, fn = obj_func_total,
           a_new = a_new, b_new = b_new, P_ref = P_ref, 
           nodes = nodes, weights = weights, div_type = div_type, param = param, D = D,
           method = "BFGS", control = list(maxit = 5000))
@@ -210,16 +211,21 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
   
   # 3. 分散共分散行列の計算
   #共通項目数少ないときのランク落ち(frag立てる）------------------------------
-  inv_H <- try(solve(H), silent=TRUE) # Hの逆行列
+  
+  inv_H <- try(solve(H), silent=TRUE)
   
   if(inherits(inv_H, "try-error")) {
+    warning(sprintf("H の逆行列計算失敗 (J=%d)", J))  # ← 追加
     CovMat <- matrix(NA, 2, 2)
     SE <- c(NA, NA)
   } else {
-    CovMat <- inv_H %*% G %*% inv_H/J # サンドイッチ推定量
-    SE <- sqrt(diag(CovMat))        # 標準誤差
+    # 条件数チェックを追加
+    cond_num <- kappa(H)
+    if(cond_num > 1e10) warning(sprintf("H が ill-conditioned (kappa=%.2e, J=%d)", cond_num, J))
+    
+    CovMat <- inv_H %*% G %*% inv_H / J
+    SE <- sqrt(diag(CovMat))
   }
-  
   return(list(A=hat_A, B=hat_B, SE_A=SE[1], SE_B=SE[2], CovMat=CovMat, conv=TRUE))
 }
 
@@ -247,7 +253,7 @@ run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
       if(n_drift > 0){
         idx <- sample(1:J, n_drift)
         b_com_new_true[idx] <- b_com_new_true[idx] + CONFIG$DRIFT_MAG
-        a_com_new_true[idx] <- a_com_new_true[idx]*1.5
+        a_com_new_true[idx] <- a_com_new_true[idx]*1.2
       }
     }
     #独自項目の生成
@@ -270,23 +276,28 @@ run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
   if(!valid_data) return(NULL)
   
   # IRT Calibration--------------------------------
-  mirt_res <- try({
-    invisible(capture.output({
-      mod_ref <- mirt(as.data.frame(resp_ref), 1, itemtype="2PL", verbose=FALSE, technical=list(NCYCLES=500))
-      mod_new <- mirt(as.data.frame(resp_new), 1, itemtype="2PL", verbose=FALSE, technical=list(NCYCLES=500))
-    }))
-    list(ref=mod_ref, new=mod_new)
-  }, silent=TRUE)
+  # mirt_res <- try({
+  #   invisible(capture.output({
+  #     mod_ref <- mirt(as.data.frame(resp_ref), 1, itemtype="2PL", verbose=FALSE, technical=list(NCYCLES=500))
+  #     mod_new <- mirt(as.data.frame(resp_new), 1, itemtype="2PL", verbose=FALSE, technical=list(NCYCLES=500))
+  #   }))
+  #   list(ref=mod_ref, new=mod_new)
+  # }, silent=TRUE)
+  # 
+  # if(inherits(mirt_res, "try-error")) return(NULL)
+  # #共通項目のパラメータ抽出
+  # cfs_ref <- coef(mirt_res$ref, IRTpars=TRUE, simplify=TRUE)$items
+  # cfs_new <- coef(mirt_res$new, IRTpars=TRUE, simplify=TRUE)$items
+  # 
+  # # Extract Common Items
+  # est_a_ref_com <- cfs_ref[1:J, "a"] / CONFIG$D_CONST; est_b_ref_com <- cfs_ref[1:J, "b"]
+  # est_a_new_com <- cfs_new[1:J, "a"] / CONFIG$D_CONST; est_b_new_com <- cfs_new[1:J, "b"]
   
-  if(inherits(mirt_res, "try-error")) return(NULL)
-  #共通項目のパラメータ抽出
-  cfs_ref <- coef(mirt_res$ref, IRTpars=TRUE, simplify=TRUE)$items
-  cfs_new <- coef(mirt_res$new, IRTpars=TRUE, simplify=TRUE)$items
-  
-  # Extract Common Items
-  est_a_ref_com <- cfs_ref[1:J, "a"] / CONFIG$D_CONST; est_b_ref_com <- cfs_ref[1:J, "b"]
-  est_a_new_com <- cfs_new[1:J, "a"] / CONFIG$D_CONST; est_b_new_com <- cfs_new[1:J, "b"]
-  
+  #オラクル条件---------------------------
+  est_a_ref_com <- a_com_ref
+  est_b_ref_com <- b_com_ref
+  est_a_new_com <- a_com_new_true
+  est_b_new_com <- b_com_new_true
   # Equating
   nodes <- seq(-4, 4, length.out=M)
   weights <- dnorm(nodes); weights <- weights/sum(weights)#正規分布の重み，正規化
@@ -299,13 +310,87 @@ run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
   if(res$conv) return(data.frame(res[c("A","B","SE_A","SE_B")], J=J, M=M)) else return(NULL)
 }
 
+# ==============================================================================
+# 初期値依存性の確認 
+# ==============================================================================
+# cat("\n【特別検証】初期値依存性のチェックを実行します...\n")
+# 
+# check_initial_values <- function() {
+#   # 1. テスト用のクリーンなデータ（外れ値なし）を1セット生成
+#   J_test <- 50
+#   M_test <- 301
+#   nodes <- seq(-4, 4, length.out=M_test)
+#   weights <- dnorm(nodes); weights <- weights/sum(weights)
+#   
+#   a_ref <- rlnorm(J_test, 0, 0.3)
+#   b_ref <- rnorm(J_test, 0, 1)
+#   a_new <- a_ref * CONFIG$TRUE_A
+#   b_new <- (b_ref - CONFIG$TRUE_B) / CONFIG$TRUE_A
+#   
+#   P_ref <- matrix(0, M_test, J_test)
+#   for(j in 1:J_test) P_ref[,j] <- p_func(nodes, a_ref[j], b_ref[j], CONFIG$D_CONST)
+#   
+#   # 2. 初期値のグリッドを作成 
+#   A_init_seq <- c(0.5, 1.0, 1.5, 2.0)
+#   B_init_seq <- c(-1.0, 0.0, 2.0)
+#   init_grid <- expand.grid(A_init = A_init_seq, B_init = B_init_seq)
+#   
+#   results <- list()
+#   
+#   # 3. 各初期値の組み合わせで最適化を実行
+#   for(i in 1:nrow(init_grid)) {
+#     init_val <- c(init_grid$A_init[i], init_grid$B_init[i])
+#     
+#     # DPD(0.1)を例として実行
+#     res <- estimate_equating_sandwich(a_new, b_new, P_ref, nodes, weights, 
+#                                       div_type="DPD", param=0.1, 
+#                                       D=CONFIG$D_CONST, start_val=init_val)
+#     
+#     if(res$conv) {
+#       results[[i]] <- data.frame(
+#         Init_A = init_val[1], Init_B = init_val[2],
+#         Est_A = res$A, Est_B = res$B,
+#         Conv = TRUE
+#       )
+#     } else {
+#       results[[i]] <- data.frame(
+#         Init_A = init_val[1], Init_B = init_val[2],
+#         Est_A = NA, Est_B = NA,
+#         Conv = FALSE
+#       )
+#     }
+#   }
+#   
+#   res_df <- bind_rows(results)
+#   
+#   # コンソールに結果を表示
+#   print(res_df)
+#   
+#   # 4. 可視化: 横軸を初期値、縦軸を推定値Aとするプロット
+#   res_df <- res_df %>% mutate(Init_Label = paste0("(", Init_A, ",", Init_B, ")"))
+#   
+#   p_init <- ggplot(res_df, aes(x=Init_Label, y=Est_B)) +
+#     geom_point(size=4, color="blue", alpha=0.7) +
+#     geom_hline(yintercept=CONFIG$TRUE_A, linetype="dashed", color="red", size=1) +
+#     theme_bw() +
+#     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#     labs(title="Initial Value Dependence Check (Target A = 1.2)", 
+#          subtitle="If stable, all points should align horizontally on the red dashed line.",
+#          x="Initial Values (A, B)", y="Estimated A")
+#   
+#   print(p_init)
+# }
+# 
+# # 実行
+# check_initial_values()
+# ==============================================================================
 # ------------------------------------------------------------------------------
 # 4. 実験メインループ (Monte Carlo Simulation)
 # ------------------------------------------------------------------------------
 results_list <- list()
 counter <- 1
 
-J_vec <- c(5, 10, 20, 30, 100, 500)#共通項目数
+J_vec <- c(5, 10, 20, 500, 1000)#共通項目数
 M_vec <- c(301)# 求積点数
 conditions <- expand.grid(J=J_vec, M=M_vec)#全組み合わせ
 
@@ -367,7 +452,7 @@ summary_stats <- all_results %>%
     Mean_SE = mean(SE_A, na.rm=TRUE),
     SD_Est = sd(A),
     
-  
+    
     SE_Ratio = mean(SE_A, na.rm=TRUE) / sd(A),
     
     Coverage = mean(abs(A - CONFIG$TRUE_A) < 1.96 * SE_A, na.rm=TRUE),
@@ -391,31 +476,49 @@ head(summary_stats)
 
 ##可視化----------------------------
 # Plot 1: 一致性 (Consistency - RMSE)
-p1 <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
-             aes(x=factor(J), y=RMSE_B, group=Method, color=Method)) +
+p1_b_A_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
+             aes(x=factor(J), y=Bias_A, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="1. Consistency (BIAS Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="Bias of A")
+
+p1_b_B_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
+                    aes(x=factor(J), y=Bias_B, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="1. Consistency (BIAS Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="Bias of B")
+
+p1_r_A_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
+                    aes(x=factor(J), y=RMSE_A, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="1. Consistency (RMSE Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="RMSE of A")
+
+p1_r_B_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
+                    aes(x=factor(J), y=RMSE_B, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
   labs(title="1. Consistency (RMSE Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="RMSE of B")
 
-p1_d_A <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
-             aes(x=factor(J), y=Bias_A, group=Method, color=Method)) +
+p1_b_A <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+                 aes(x=factor(J), y=Bias_A, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="1. Consistency (BIAS A Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="RMSE of A")
+  labs(title="1. Consistency (BIAS A Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="BIAS of A")
 
-p1_d_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+p1_b_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
                  aes(x=factor(J), y=Bias_B, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="1. Consistency (BIAS B Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="RMSE of B")
+  labs(title="1. Consistency (BIAS B Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="BIAS of B")
 
-p1_d_A <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+p1_r_A <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
                  aes(x=factor(J), y=RMSE_A, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
   labs(title="1. Consistency (RMSE A Convergence)", subtitle="Condition: With_Drift", x="Items (J)", y="RMSE of A")
 
-p1_d_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
+p1_r_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
                  aes(x=factor(J), y=RMSE_B, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
@@ -451,8 +554,10 @@ p4_d_B <- ggplot(dat_norm, aes(sample=B)) + stat_qq(aes(color=Method)) + stat_qq
   facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
   labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=500, M=301", x="Theoretical", y="Sample")
 
-grid.arrange(p1_d_A, p1_d_B,ncol=2)
-
+grid.arrange(p1_b_A, p1_b_B,ncol=2)
+grid.arrange(p1_r_A, p1_r_B,ncol=2)
+grid.arrange(p1_b_A_no, p1_b_B_no, ncol=2)
+grid.arrange(p1_r_A_no, p1_r_B_no, ncol = 2)
 
 library(ggplot2)
 library(dplyr)
@@ -502,7 +607,7 @@ methods_list <- list(
   list(name="DPD(0.01) ", type="DPD", param=0.0001), # KL近似
   list(name="DPD(0.5)",    type="DPD", param=0.5) ,
   list(name="gamma(0.5)",    type="gamma", param=0.5)
-
+  
 )
 
 
