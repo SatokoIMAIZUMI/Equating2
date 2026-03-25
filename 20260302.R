@@ -18,7 +18,7 @@ set.seed(1987)
 
 CONFIG <- list(
   N_EXAMINEES = 5000,
-  N_REPS = 2,
+  N_REPS = 200,
   N_UNIQUE = 20,
   TRUE_A = 1.2,
   TRUE_B = 0.5,
@@ -104,7 +104,6 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
   hat_A <- opt$par[1]; hat_B <- opt$par[2]
   
   # 2. Sandwich Variance: V = H^-1 G H^-1
-  # 解析解を用いて H と G を同時に計算する (高速化)
   
   J <- length(a_new)
   M <- length(nodes)
@@ -249,8 +248,6 @@ run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
   
   N <- CONFIG$N_EXAMINEES
   N_uniq <- CONFIG$N_UNIQUE
-  
-  # 【修正点】オラクル条件では再生成が不要なため、whileループとretry_countを削除
   
   # Param Generation
   a_com_ref <- rlnorm(J, 0, 0.3); b_com_ref <- rnorm(J, 0, 1)
