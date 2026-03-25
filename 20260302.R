@@ -13,18 +13,22 @@ for (p in packages) {
   }
 }
 
-set.seed(425)
+set.seed(1987)
 
 
 CONFIG <- list(
   N_EXAMINEES = 5000,
-  N_REPS = 100,
+  N_REPS = 2,
   N_UNIQUE = 20,
   TRUE_A = 1.2,
   TRUE_B = 0.5,
   D_CONST = 1.702,
-  DRIFT_MAG = 0.5,       # ドリフト量(b)大きすぎ？
-  OUTLIER_PROP = 0.05    # 外れ値の割合
+  DRIFT_MAG = 10,       # ドリフト量(b)
+  OUTLIER_PROP = 0.03,    # 外れ値の割合
+  
+  CONTAM_RATE = 0.03,
+  CONTAM_MEAN = -10,
+  CONTAM_SD = 2
 )
 
 # ------------------------------------------------------------------------------
@@ -59,6 +63,10 @@ calc_div_element <- function(P, pi_val, div_type="DPD", param=0.1) {
     term1 <- -(1/gamma) * log(P * pi_val^gamma + (1-P) * (1-pi_val)^gamma)
     term2 <- (1/(1+gamma)) * log(pi_val^(1+gamma) + (1-pi_val)^(1+gamma))
     return(term1 + term2)
+    
+  } else if(div_type == "Haebara"){
+    return((P- pi_val)^2)
+
   } else { 
     # KL (Approx)
     return(P * log(P/pi_val) + (1-P) * log((1-P)/(1-pi_val)))
@@ -126,16 +134,16 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
       p1p <- pi_val * (1 - pi_val)
       
       # --- 勾配用パーツ (1階微分) ---
-      dz_dA <- (D * aj / hat_A^2) * (theta - hat_B)
-      dz_dB <- (D * aj / hat_A)
+      dz_dA <- -(D * aj / hat_A^2) * (theta - hat_B)
+      dz_dB <- -(D * aj / hat_A)
       dz_d_eta <- c(dz_dA, dz_dB)
       
       d_pi_d_eta <- p1p * dz_d_eta
       
       # --- ヘッセ行列用パーツ (2階微分) ---
       # zの2階微分
-      d2z_dA2 <- -2 * (D * aj / hat_A^3) * (theta - hat_B)
-      d2z_dAdB <- - (D * aj / hat_A^2)
+      d2z_dA2 <- 2 * (D * aj / hat_A^3) * (theta - hat_B)
+      d2z_dAdB <-  (D * aj / hat_A^2)
       d2z_d_eta2 <- matrix(c(d2z_dA2, d2z_dAdB, d2z_dAdB, 0), 2, 2)
       
       # piの2階微分
@@ -182,7 +190,12 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
         
         d2D_dpi2 <- term1_2nd + term2_2nd
         
-      } else { 
+      }
+      else if(div_type == "Haebara"){
+        dD_dpi <- 2 * (pi_val - P_val)
+        d2D_dpi2 <- 2
+        
+      }else { 
         # KL
         dD_dpi <- (pi_val - P_val) / p1p
         d2D_dpi2 <- (p1p - (pi_val - P_val)*(1 - 2*pi_val)) / (p1p^2)
@@ -196,7 +209,7 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
       
       # --- 勾配ベクトル (Psi) の蓄積 ---
       # psi_jm = dD/dpi * d_pi/d_eta * w
-      psi_jm <- (dD_dpi * d_pi_d_eta) * wt　#これだともしかして重みが2乗されるかも
+      psi_jm <- (dD_dpi * d_pi_d_eta) * wt　
       Psi_j_sum <- Psi_j_sum + psi_jm
     }
     
@@ -236,157 +249,56 @@ run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
   
   N <- CONFIG$N_EXAMINEES
   N_uniq <- CONFIG$N_UNIQUE
-  valid_data <- FALSE
-  retry_count <- 0
   
-  while(!valid_data && retry_count < 10) {# 全問正解，不正解がでたら再生成
-    retry_count <- retry_count + 1
+  # 【修正点】オラクル条件では再生成が不要なため、whileループとretry_countを削除
+  
+  # Param Generation
+  a_com_ref <- rlnorm(J, 0, 0.3); b_com_ref <- rnorm(J, 0, 1)
+  a_com_new_true <- a_com_ref * CONFIG$TRUE_A
+  b_com_new_true <- (b_com_ref - CONFIG$TRUE_B) / CONFIG$TRUE_A
+  
+  ## 外れ値-------------------------------------------------
+  if(has_outlier){#外れ値の導入
+    is_contam <- rbinom(J, 1, CONFIG$CONTAM_RATE) == 1
+    n_contam <- sum(is_contam)
     
-    # Param Generation
-    a_com_ref <- rlnorm(J, 0, 0.3); b_com_ref <- rnorm(J, 0, 1)
-    a_com_new_true <- a_com_ref * CONFIG$TRUE_A
-    b_com_new_true <- (b_com_ref - CONFIG$TRUE_B) / CONFIG$TRUE_A
-    
-    ## 外れ値-------------------------------------------------
-    if(has_outlier){#外れ値の導入
-      n_drift <- floor(J * CONFIG$OUTLIER_PROP)
-      if(n_drift > 0){
-        idx <- sample(1:J, n_drift)
-        b_com_new_true[idx] <- b_com_new_true[idx] + CONFIG$DRIFT_MAG
-        a_com_new_true[idx] <- a_com_new_true[idx]*1.2
-      }
+    if(n_contam > 0){
+      b_com_new_true[is_contam]<- rnorm(n_contam, CONFIG$CONTAM_MEAN, CONFIG$CONTAM_SD)
     }
-    #独自項目の生成
-    a_uniq_ref <- rlnorm(N_uniq, 0, 0.3); b_uniq_ref <- rnorm(N_uniq, 0, 1)
-    a_uniq_new <- rlnorm(N_uniq, 0, 0.3); b_uniq_new <- rnorm(N_uniq, 0, 1)
-    #全項目を結合
-    a_ref_total <- c(a_com_ref, a_uniq_ref); b_ref_total <- c(b_com_ref, b_uniq_ref)
-    a_new_total <- c(a_com_new_true, a_uniq_new); b_new_total <- c(b_com_new_true, b_uniq_new)
-    
-    # Data Generation
-    #能力値の生成
-    th_ref <- rnorm(N); th_new <- rnorm(N)
-    #反応データ生成：正答確率の計算（受験者×項目），一様乱数との比較，正誤の決定
-    resp_ref <- 1 * (t(sapply(th_ref, function(t) p_func(t, a_ref_total, b_ref_total))) > matrix(runif(N*(J+N_uniq)), N, J+N_uniq))
-    resp_new <- 1 * (t(sapply(th_new, function(t) p_func(t, a_new_total, b_new_total))) > matrix(runif(N*(J+N_uniq)), N, J+N_uniq))
-    colnames(resp_ref) <- colnames(resp_new) <- paste0("I", 1:(J+N_uniq))
-    #全問正解，不正解の項目チェック
-    if(all(apply(resp_ref, 2, var) > 0) && all(apply(resp_new, 2, var) > 0)) valid_data <- TRUE
   }
-  if(!valid_data) return(NULL)
   
-  # IRT Calibration--------------------------------
-  # mirt_res <- try({
-  #   invisible(capture.output({
-  #     mod_ref <- mirt(as.data.frame(resp_ref), 1, itemtype="2PL", verbose=FALSE, technical=list(NCYCLES=500))
-  #     mod_new <- mirt(as.data.frame(resp_new), 1, itemtype="2PL", verbose=FALSE, technical=list(NCYCLES=500))
-  #   }))
-  #   list(ref=mod_ref, new=mod_new)
-  # }, silent=TRUE)
-  # 
-  # if(inherits(mirt_res, "try-error")) return(NULL)
-  # #共通項目のパラメータ抽出
-  # cfs_ref <- coef(mirt_res$ref, IRTpars=TRUE, simplify=TRUE)$items
-  # cfs_new <- coef(mirt_res$new, IRTpars=TRUE, simplify=TRUE)$items
-  # 
-  # # Extract Common Items
-  # est_a_ref_com <- cfs_ref[1:J, "a"] / CONFIG$D_CONST; est_b_ref_com <- cfs_ref[1:J, "b"]
-  # est_a_new_com <- cfs_new[1:J, "a"] / CONFIG$D_CONST; est_b_new_com <- cfs_new[1:J, "b"]
+  #独自項目の生成
+  a_uniq_ref <- rlnorm(N_uniq, 0, 0.3); b_uniq_ref <- rnorm(N_uniq, 0, 1)
+  a_uniq_new <- rlnorm(N_uniq, 0, 0.3); b_uniq_new <- rnorm(N_uniq, 0, 1)
+  #全項目を結合
+  a_ref_total <- c(a_com_ref, a_uniq_ref); b_ref_total <- c(b_com_ref, b_uniq_ref)
+  a_new_total <- c(a_com_new_true, a_uniq_new); b_new_total <- c(b_com_new_true, b_uniq_new)
+  
+  # Data Generation と IRT Calibration はオラクル条件のためスキップ
   
   #オラクル条件---------------------------
   est_a_ref_com <- a_com_ref
   est_b_ref_com <- b_com_ref
   est_a_new_com <- a_com_new_true
   est_b_new_com <- b_com_new_true
+  
   # Equating
   nodes <- seq(-4, 4, length.out=M)
   weights <- dnorm(nodes); weights <- weights/sum(weights)#正規分布の重み，正規化
+  
   #基準テストの確率行列
   P_ref <- matrix(0, M, J)
   for(j in 1:J) P_ref[,j] <- p_func(nodes, est_a_ref_com[j], est_b_ref_com[j], CONFIG$D_CONST)
+  
   #等化係数推定
   res <- estimate_equating_sandwich(est_a_new_com, est_b_new_com, P_ref, nodes, weights, div_type, param, CONFIG$D_CONST)
   
-  if(res$conv) return(data.frame(res[c("A","B","SE_A","SE_B")], J=J, M=M)) else return(NULL)
+  if(res$conv) return(data.frame(res[c("A","B","SE_A","SE_B")], J=J, M=M, a_ref = I(list(est_a_ref_com)),
+                                 b_ref = I(list(est_b_ref_com)),
+                                 a_new = I(list(est_a_new_com)),
+                                 b_new = I(list(est_b_new_com)))) else return(NULL)
 }
-
-# ==============================================================================
-# 初期値依存性の確認 
-# ==============================================================================
-# cat("\n【特別検証】初期値依存性のチェックを実行します...\n")
-# 
-# check_initial_values <- function() {
-#   # 1. テスト用のクリーンなデータ（外れ値なし）を1セット生成
-#   J_test <- 50
-#   M_test <- 301
-#   nodes <- seq(-4, 4, length.out=M_test)
-#   weights <- dnorm(nodes); weights <- weights/sum(weights)
-#   
-#   a_ref <- rlnorm(J_test, 0, 0.3)
-#   b_ref <- rnorm(J_test, 0, 1)
-#   a_new <- a_ref * CONFIG$TRUE_A
-#   b_new <- (b_ref - CONFIG$TRUE_B) / CONFIG$TRUE_A
-#   
-#   P_ref <- matrix(0, M_test, J_test)
-#   for(j in 1:J_test) P_ref[,j] <- p_func(nodes, a_ref[j], b_ref[j], CONFIG$D_CONST)
-#   
-#   # 2. 初期値のグリッドを作成 
-#   A_init_seq <- c(0.5, 1.0, 1.5, 2.0)
-#   B_init_seq <- c(-1.0, 0.0, 2.0)
-#   init_grid <- expand.grid(A_init = A_init_seq, B_init = B_init_seq)
-#   
-#   results <- list()
-#   
-#   # 3. 各初期値の組み合わせで最適化を実行
-#   for(i in 1:nrow(init_grid)) {
-#     init_val <- c(init_grid$A_init[i], init_grid$B_init[i])
-#     
-#     # DPD(0.1)を例として実行
-#     res <- estimate_equating_sandwich(a_new, b_new, P_ref, nodes, weights, 
-#                                       div_type="DPD", param=0.1, 
-#                                       D=CONFIG$D_CONST, start_val=init_val)
-#     
-#     if(res$conv) {
-#       results[[i]] <- data.frame(
-#         Init_A = init_val[1], Init_B = init_val[2],
-#         Est_A = res$A, Est_B = res$B,
-#         Conv = TRUE
-#       )
-#     } else {
-#       results[[i]] <- data.frame(
-#         Init_A = init_val[1], Init_B = init_val[2],
-#         Est_A = NA, Est_B = NA,
-#         Conv = FALSE
-#       )
-#     }
-#   }
-#   
-#   res_df <- bind_rows(results)
-#   
-#   # コンソールに結果を表示
-#   print(res_df)
-#   
-#   # 4. 可視化: 横軸を初期値、縦軸を推定値Aとするプロット
-#   res_df <- res_df %>% mutate(Init_Label = paste0("(", Init_A, ",", Init_B, ")"))
-#   
-#   p_init <- ggplot(res_df, aes(x=Init_Label, y=Est_B)) +
-#     geom_point(size=4, color="blue", alpha=0.7) +
-#     geom_hline(yintercept=CONFIG$TRUE_A, linetype="dashed", color="red", size=1) +
-#     theme_bw() +
-#     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-#     labs(title="Initial Value Dependence Check (Target A = 1.2)", 
-#          subtitle="If stable, all points should align horizontally on the red dashed line.",
-#          x="Initial Values (A, B)", y="Estimated A")
-#   
-#   print(p_init)
-# }
-# 
-# # 実行
-# check_initial_values()
-# ==============================================================================
-# ------------------------------------------------------------------------------
-# 4. 実験メインループ (Monte Carlo Simulation)
-# ------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
 results_list <- list()
 counter <- 1
 
@@ -396,7 +308,8 @@ conditions <- expand.grid(J=J_vec, M=M_vec)#全組み合わせ
 
 methods <- list(
   #list(name="KL (Approx)", type="DPD", p=0.01),
-  list(name="DPD (0.1)",   type="DPD", p=0.1),
+  list(name="Haebara",   type="Haebara", p=0),
+  list(name="KL",   type="KL", p=0),
   list(name="DPD (0.3)",   type="DPD", p=0.3),
   list(name="DPD (0.5)",   type="DPD", p=0.5),
   list(name="DPD (1.0)",   type="DPD", p=1.0),
@@ -423,7 +336,7 @@ for(has_outlier in outlier_conds) {
       for(i in 1:CONFIG$N_REPS){
         res <- run_simulation_core(J_curr, M_curr, met$type, met$p, has_outlier)
         if(!is.null(res)){
-          res$Method <- met$name; res$Condition <- cond_label
+          res$Method <- met$name; res$Condition <- cond_label; res$Rep <- i
           results_list[[counter]] <- res; counter <- counter + 1
         }
       }
@@ -480,25 +393,29 @@ p1_b_A_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"),
              aes(x=factor(J), y=Bias_A, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="1. Consistency (BIAS Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="Bias of A")
+  labs(title="1. Consistency (BIAS Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="Bias of A")+
+  coord_cartesian(ylim = c(-0.0021, 0.0021))
 
 p1_b_B_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
                     aes(x=factor(J), y=Bias_B, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="1. Consistency (BIAS Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="Bias of B")
+  labs(title="1. Consistency (BIAS Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="Bias of B")+
+  coord_cartesian(ylim = c(-0.0021, 0.0021))
 
 p1_r_A_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
                     aes(x=factor(J), y=RMSE_A, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
   labs(title="1. Consistency (RMSE Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="RMSE of A")
+  #coord_cartesian(ylim = c(0, 0.001))
 
 p1_r_B_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
                     aes(x=factor(J), y=RMSE_B, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
   labs(title="1. Consistency (RMSE Convergence)", subtitle="Condition: No Outlier", x="Items (J)", y="RMSE of B")
+  #coord_cartesian(ylim = c(0, 0.001))
 
 p1_b_A <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
                  aes(x=factor(J), y=Bias_A, group=Method, color=Method)) +
@@ -530,8 +447,8 @@ p2 <- ggplot(summary_stats %>% filter(Condition == "With_Drift"),
   geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
   facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="2. SE Accuracy (Sandwich/Empirical)", subtitle="Target=1.0 (With Drift)", x="Items (J)", y="SE Ratio")
-
+  labs(title="2. SE Accuracy(A) (Sandwich/Empirical)", subtitle="Target=1.0 (With Drift)", x="Items (J)", y="SE Ratio")+
+  coord_cartesian(ylim = c(0, 2))
 p2_B <- ggplot(summary_stats %>% filter(Condition == "With_Drift"), 
              aes(x=factor(J), y=SE_Ratio_B, group=Method, color=Method)) +
   geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
@@ -544,7 +461,14 @@ p2_no <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"),
   geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
   facet_wrap(~ M, labeller = label_both) +
   theme_bw() + scale_color_brewer(palette="Set1") +
-  labs(title="2. SE Accuracy (Sandwich/Empirical)", subtitle="Target=1.0 (With Drift)", x="Items (J)", y="SE Ratio")
+  labs(title="2. SE Accuracy(A) (Sandwich/Empirical)", subtitle="Target=1.0 (No_Outlier)", x="Items (J)", y="SE Ratio")
+
+p2_no_B <- ggplot(summary_stats %>% filter(Condition == "No_Outlier"), 
+                aes(x=factor(J), y=SE_Ratio_B, group=Method, color=Method)) +
+  geom_line(size=1) + geom_point(size=3) + geom_hline(yintercept=1.0, linetype="dashed") +
+  facet_wrap(~ M, labeller = label_both) +
+  theme_bw() + scale_color_brewer(palette="Set1") +
+  labs(title="2. SE Accuracy(B)(Sandwich/Empirical)", subtitle="Target=1.0 (No_Outlier)", x="Items (J)", y="SE Ratio")
 
 # Plot 3: 信頼区間 (Coverage) - 外れ値の影響比較
 p3 <- ggplot(summary_stats, aes(x=factor(J), y=Coverage, group=Method, color=Method)) +
@@ -568,6 +492,46 @@ p4_d_B <- ggplot(dat_norm, aes(sample=B)) + stat_qq(aes(color=Method)) + stat_qq
   facet_wrap(~ Method) + theme_bw() + scale_color_brewer(palette="Set1") +
   labs(title=" Asymptotic Normality", subtitle="Condition: With Drift, J=1000, M=301", x="Theoretical", y="Sample")
 
+library(dplyr)
+
+# 1. データを標準化（手法ごとに平均0, 標準偏差1に変換）
+dat_norm <- dat_norm %>%
+  group_by(Method) %>%
+  mutate(
+    Z_A = scale(A)[, 1],
+    Z_B = scale(B)[, 1]
+  ) %>%
+  ungroup()
+
+# 2. AのQ-Qプロット（標準化済み）
+p4_d_A <- ggplot(dat_norm, aes(sample = Z_A)) + 
+  stat_qq(aes(color = Method)) + 
+  # stat_qq_line() の代わりに y=x の直線を明示的に引く
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") + 
+  facet_wrap(~ Method) + 
+  theme_bw() + 
+  scale_color_brewer(palette = "Set1") + 
+  labs(title = "Asymptotic Normality (Standardized A)", 
+       subtitle = "Condition: With Drift, J=1000, M=301", 
+       x = "Theoretical Quantiles N(0,1)", 
+       y = "Standardized Sample Quantiles")
+
+# 3. BのQ-Qプロット（標準化済み）
+p4_d_B <- ggplot(dat_norm, aes(sample = Z_B)) + 
+  stat_qq(aes(color = Method)) + 
+  # stat_qq_line() の代わりに y=x の直線を明示的に引く
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") + 
+  facet_wrap(~ Method) + 
+  theme_bw() + 
+  scale_color_brewer(palette = "Set1") + 
+  labs(title = "Asymptotic Normality (Standardized B)", 
+       subtitle = "Condition: With Drift, J=1000, M=301", 
+       x = "Theoretical Quantiles N(0,1)", 
+       y = "Standardized Sample Quantiles")
+
+# 描画
+print(p4_d_A)
+print(p4_d_B)
 grid.arrange(p1_b_A, p1_b_B,ncol=2)
 grid.arrange(p1_r_A, p1_r_B,ncol=2)
 grid.arrange(p1_b_A_no, p1_b_B_no, ncol=2)
@@ -576,6 +540,38 @@ grid.arrange(p1_r_A_no, p1_r_B_no, ncol = 2)
 library(ggplot2)
 library(dplyr)
 
+
+library(ggplot2)
+library(dplyr)
+
+# 1. データの抽出
+# 外れ値あり（With_Drift）、項目数 J=500 の 1回目のシミュレーション結果を抽出します
+# （※どの推定量の手法でも生成された真のbパラメータは同じなので、最初の1行を取得します）
+target_row <- all_results %>% 
+  filter(Condition == "With_Drift", J == 500, Rep == 1) %>% 
+  slice(1)
+
+b_params <- target_row$b_new[[1]]
+
+# ggplotで描画するためにデータフレームに変換
+df_plot <- data.frame(b_value = b_params)
+
+# 2. ヒストグラムの描画
+g_hist <- ggplot(df_plot, aes(x = b_value)) +
+  geom_histogram(
+    fill = "skyblue",   # 塗りつぶしの色をスカイブルーに
+    color = "white",    # ビンの枠線を白にして見やすく
+    binwidth = 0.3      # ビンの幅（狭め）。分布の広がりに合わせて0.1〜0.5程度で調整してください
+  ) +
+  theme_bw(base_size = 14) + # 少し文字サイズを大きくして見やすく
+  labs(
+    title = "Histogram of Item Difficulty with Outliers",
+    subtitle = paste0("Total Items: ", length(b_params)),
+    x = "Difficulty Parameter (b)",
+    y = "Frequency"
+  )
+
+print(g_hist)
 # 信頼帯プロット------------------------------------------------
 # ==============================================================================
 # 1. 準備：データ生成（外れ値あり）
@@ -598,7 +594,7 @@ b_ref <- rnorm(J_test, 0, 1)
 a_new_true <- a_ref * TRUE_A
 b_new_true <- (b_ref - TRUE_B) / TRUE_A
 
-# 【重要】観測データとして「外れ値（パラメタドリフト）」を混入させる
+
 a_new_obs <- a_new_true
 b_new_obs <- b_new_true
 idx_drift <- sample(1:J_test, floor(J_test * OUTLIER_PROP))
