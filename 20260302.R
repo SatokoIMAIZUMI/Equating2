@@ -23,9 +23,15 @@ CONFIG <- list(
   TRUE_A = 1.2,
   TRUE_B = 0.5,
   D_CONST = 1.702,
-  DRIFT_MAG = 10,       # ドリフト量(b)
-  OUTLIER_PROP = 0.03,    # 外れ値の割合
   
+  # --- アイテムバンクの母集団分布パラメータ ---
+  BANK_MU_A = 0,      # 識別力の対数正規分布の平均 (log(a)の平均)
+  BANK_SD_A = 0.3,    # 識別力の対数正規分布の標準偏差
+  BANK_MU_B = 0,      # 困難度の正規分布の平均
+  BANK_SD_B = 1.0,    # 困難度の正規分布の標準偏差
+  
+  DRIFT_MAG = 10,     
+  OUTLIER_PROP = 0.03,
   CONTAM_RATE = 0.03,
   CONTAM_MEAN = -10,
   CONTAM_SD = 2
@@ -227,7 +233,7 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
   inv_H <- try(solve(H), silent=TRUE)
   
   if(inherits(inv_H, "try-error")) {
-    warning(sprintf("H の逆行列計算失敗 (J=%d)", J))  # ← 追加
+    warning(sprintf("H の逆行列計算失敗 (J=%d)", J)) 
     CovMat <- matrix(NA, 2, 2)
     SE <- c(NA, NA)
   } else {
@@ -241,109 +247,129 @@ estimate_equating_sandwich <- function(a_new, b_new, P_ref, nodes, weights, div_
   return(list(A=hat_A, B=hat_B, SE_A=SE[1], SE_B=SE[2], CovMat=CovMat, conv=TRUE))
 }
 
-# ------------------------------------------------------------------------------
-# 3. シミュレーション実行コア (1反復分)
-# ------------------------------------------------------------------------------
-run_simulation_core <- function(J, M, div_type, param, has_outlier=FALSE){
+
+#　3.データ生成------------------------------
+generate_sim_data <- function(J, M, has_outlier) {
   
-  N <- CONFIG$N_EXAMINEES
-  N_uniq <- CONFIG$N_UNIQUE
+  # 共通項目の生成
+  a_com_ref <- rlnorm(J, 0, 0.3)
+  b_com_ref <- rnorm(J, 0, 1)
   
-  # Param Generation
-  a_com_ref <- rlnorm(J, 0, 0.3); b_com_ref <- rnorm(J, 0, 1)
   a_com_new_true <- a_com_ref * CONFIG$TRUE_A
   b_com_new_true <- (b_com_ref - CONFIG$TRUE_B) / CONFIG$TRUE_A
   
-  ## 外れ値-------------------------------------------------
-  if(has_outlier){#外れ値の導入
+  # 外れ値の導入
+  if(has_outlier) {
     is_contam <- rbinom(J, 1, CONFIG$CONTAM_RATE) == 1
     n_contam <- sum(is_contam)
-    
-    if(n_contam > 0){
-      b_com_new_true[is_contam]<- rnorm(n_contam, CONFIG$CONTAM_MEAN, CONFIG$CONTAM_SD)
+    if(n_contam > 0) {
+      b_com_new_true[is_contam] <- rnorm(n_contam, CONFIG$CONTAM_MEAN, CONFIG$CONTAM_SD)
     }
   }
   
-  #独自項目の生成
-  a_uniq_ref <- rlnorm(N_uniq, 0, 0.3); b_uniq_ref <- rnorm(N_uniq, 0, 1)
-  a_uniq_new <- rlnorm(N_uniq, 0, 0.3); b_uniq_new <- rnorm(N_uniq, 0, 1)
-  #全項目を結合
-  a_ref_total <- c(a_com_ref, a_uniq_ref); b_ref_total <- c(b_com_ref, b_uniq_ref)
-  a_new_total <- c(a_com_new_true, a_uniq_new); b_new_total <- c(b_com_new_true, b_uniq_new)
+  # 積分求積点と基準テストの正答確率
+  nodes <- seq(-4, 4, length.out = M)
+  weights <- dnorm(nodes)
+  weights <- weights / sum(weights)
   
-  # Data Generation と IRT Calibration はオラクル条件のためスキップ
-  
-  #オラクル条件---------------------------
-  est_a_ref_com <- a_com_ref
-  est_b_ref_com <- b_com_ref
-  est_a_new_com <- a_com_new_true
-  est_b_new_com <- b_com_new_true
-  
-  # Equating
-  nodes <- seq(-4, 4, length.out=M)
-  weights <- dnorm(nodes); weights <- weights/sum(weights)#正規分布の重み，正規化
-  
-  #基準テストの確率行列
   P_ref <- matrix(0, M, J)
-  for(j in 1:J) P_ref[,j] <- p_func(nodes, est_a_ref_com[j], est_b_ref_com[j], CONFIG$D_CONST)
+  for(j in 1:J) {
+    P_ref[,j] <- p_func(nodes, a_com_ref[j], b_com_ref[j], CONFIG$D_CONST)
+  }
   
-  #等化係数推定
-  res <- estimate_equating_sandwich(est_a_new_com, est_b_new_com, P_ref, nodes, weights, div_type, param, CONFIG$D_CONST)
-  
-  if(res$conv) return(data.frame(res[c("A","B","SE_A","SE_B")], J=J, M=M, a_ref = I(list(est_a_ref_com)),
-                                 b_ref = I(list(est_b_ref_com)),
-                                 a_new = I(list(est_a_new_com)),
-                                 b_new = I(list(est_b_new_com)))) else return(NULL)
+  # 後の推定で使用するデータをリストにまとめて返す
+  return(list(
+    a_ref = a_com_ref,
+    b_ref = b_com_ref,
+    a_new = a_com_new_true,
+    b_new = b_com_new_true,
+    P_ref = P_ref,
+    nodes = nodes,
+    weights = weights
+  ))
 }
-#------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+# 4. ループ実行部分 (シミュレーション設計の修正)
+# ------------------------------------------------------------------------------
 results_list <- list()
 counter <- 1
 
-J_vec <- c(5, 10, 20, 500, 1000)#共通項目数
-M_vec <- c(301)# 求積点数
-conditions <- expand.grid(J=J_vec, M=M_vec)#全組み合わせ
+J_vec <- c(5, 10, 20, 500, 1000) # 共通項目数
+M_vec <- c(301)                  # 求積点数
+conditions <- expand.grid(J=J_vec, M=M_vec)
 
 methods <- list(
-  #list(name="KL (Approx)", type="DPD", p=0.01),
-  list(name="Haebara",   type="Haebara", p=0),
-  list(name="KL",   type="KL", p=0),
-  list(name="DPD (0.3)",   type="DPD", p=0.3),
-  list(name="DPD (0.5)",   type="DPD", p=0.5),
-  list(name="DPD (1.0)",   type="DPD", p=1.0),
-  #list(name="DPD (1.0)",   type="DPD", p=1.0),
-  #list(name="Gamma (0.1)", type="gamma", p=0.1),
-  list(name="Gamma (0.3)", type="gamma", p=0.3),
-  list(name="Gamma (0.5)", type="gamma", p=0.5),
-  list(name="Gamma (1.0)", type="gamma", p=1.0)
+  list(name="Haebara",     type="Haebara", p=0),
+  list(name="KL",          type="KL",      p=0),
+  list(name="DPD (0.3)",   type="DPD",     p=0.3),
+  list(name="DPD (0.5)",   type="DPD",     p=0.5),
+  list(name="DPD (1.0)",   type="DPD",     p=1.0),
+  list(name="Gamma (0.3)", type="gamma",   p=0.3),
+  list(name="Gamma (0.5)", type="gamma",   p=0.5),
+  list(name="Gamma (1.0)", type="gamma",   p=1.0)
 )
 
-outlier_conds <- c(TRUE,FALSE)
+outlier_conds <- c(TRUE, FALSE)
 
 cat("【Step 1/2】統計的性質の検証シミュレーションを開始します...\n")
-cat(sprintf("  総条件数: %d x 3手法 x 2状況 (反復各%d回)\n", nrow(conditions), CONFIG$N_REPS))
+cat(sprintf("  総条件数: %d x %d手法 x 2状況 (反復各%d回)\n", nrow(conditions), length(methods), CONFIG$N_REPS))
 
+# ループの階層: 状況 -> 条件(J, M) -> 反復(Rep) -> 手法(Method)
 for(has_outlier in outlier_conds) {
   cond_label <- if(has_outlier) "With_Drift" else "No_Outlier"
   cat(sprintf("\n=== Condition: %s ===\n", cond_label))
   
-  for(met in methods) {
-    cat(sprintf("  Method: %s ", met$name))
-    for(k in 1:nrow(conditions)) {
-      J_curr <- conditions$J[k]; M_curr <- conditions$M[k]
-      for(i in 1:CONFIG$N_REPS){
-        res <- run_simulation_core(J_curr, M_curr, met$type, met$p, has_outlier)
-        if(!is.null(res)){
-          res$Method <- met$name; res$Condition <- cond_label; res$Rep <- i
-          results_list[[counter]] <- res; counter <- counter + 1
+  for(k in 1:nrow(conditions)) {
+    J_curr <- conditions$J[k]
+    M_curr <- conditions$M[k]
+    cat(sprintf("  J=%d, M=%d : ", J_curr, M_curr))
+    
+    for(i in 1:CONFIG$N_REPS) {
+      
+      
+      sim_data <- generate_sim_data(J_curr, M_curr, has_outlier)
+      
+      
+      for(met in methods) {
+        
+        # 等化係数推定
+        res <- estimate_equating_sandwich(
+          a_new    = sim_data$a_new, 
+          b_new    = sim_data$b_new, 
+          P_ref    = sim_data$P_ref, 
+          nodes    = sim_data$nodes, 
+          weights  = sim_data$weights, 
+          div_type = met$type, 
+          param    = met$p, 
+          D        = CONFIG$D_CONST
+        )
+        
+        if(res$conv) {
+          # 結果の保存
+          res_df <- data.frame(
+            A = res$A, B = res$B, SE_A = res$SE_A, SE_B = res$SE_B,
+            J = J_curr, M = M_curr,
+            a_ref = I(list(sim_data$a_ref)),
+            b_ref = I(list(sim_data$b_ref)),
+            a_new = I(list(sim_data$a_new)),
+            b_new = I(list(sim_data$b_new)),
+            Method = met$name,
+            Condition = cond_label,
+            Rep = i
+          )
+          results_list[[counter]] <- res_df
+          counter <- counter + 1
         }
       }
-      cat(".")
     }
     cat(" Done\n")
   }
 }
 
 all_results <- bind_rows(results_list)
+
 
 # ------------------------------------------------------------------------------
 # 5. 集計と可視化 (統計的性質)
